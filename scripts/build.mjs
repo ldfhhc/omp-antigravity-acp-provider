@@ -200,9 +200,26 @@ const result = await build({
             replacement: "\t\tthis.disposed = true;\n\t\tthis.quotaCache = undefined;\n\t\tthis.quotaCacheOwner = undefined;\n\t\tawait this.closeBindings();\n\t\tthis.sessionStore?.clear();",
           },
           {
-            name: "collect hidden seed text",
+            name: "guard hidden seed updates",
             anchor: "\tprivate consumeUpdate(binding: Binding | undefined, notification: SessionNotification): void {\n\t\tif (!binding || notification.sessionId !== binding.session.sessionId) return;",
-            replacement: "\tprivate consumeUpdate(binding: Binding | undefined, notification: SessionNotification): void {\n\t\tif (!binding || notification.sessionId !== binding.session.sessionId) return;\n\t\tif (binding.ompSeeding && notification.update.sessionUpdate === \"agent_message_chunk\" && notification.update.content.type === \"text\") {\n\t\t\tbinding.ompSeedText = (binding.ompSeedText ?? \"\") + notification.update.content.text;\n\t\t}",
+            replacement: [
+              "\tprivate consumeUpdate(binding: Binding | undefined, notification: SessionNotification): void {",
+              "\t\tif (!binding || notification.sessionId !== binding.session.sessionId) return;",
+              "\t\tif (binding.ompSeedGuard) {",
+              "\t\t\tif (notification.update.sessionUpdate === 'agent_message_chunk' && notification.update.content.type === 'text') binding.ompSeedGuard.appendText(notification.update.content.text);",
+              "\t\t\telse if (notification.update.sessionUpdate === 'tool_call' || notification.update.sessionUpdate === 'tool_call_update') binding.ompSeedGuard.rejectTool();",
+              "\t\t}",
+            ].join("\n"),
+          },
+          {
+            name: "stop seed MCP calls before execution",
+            anchor: '\t\tif (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested) {',
+            replacement: '\t\tbinding?.ompSeedGuard?.rejectTool();\n\t\tif (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested) {',
+          },
+          {
+            name: "stop seed permission requests",
+            anchor: '\t\tif (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested || request.sessionId !== binding.session.sessionId) {',
+            replacement: '\t\tif (binding && request.sessionId === binding.session.sessionId) binding.ompSeedGuard?.rejectTool();\n\t\tif (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested || request.sessionId !== binding.session.sessionId) {',
           },
           {
             name: "validated message fingerprint memo",
@@ -255,6 +272,7 @@ const result = await build({
             replacement: [
               "\t\t// A new/edited user request is not a tool-result continuation of the",
               "\t\t// previous ACP prompt. Never let old pending results swallow it.",
+              "\t\tthis.ompRebaseImageHistory(binding, context);",
               "\t\tif (binding.turnCompletion || binding.permission || binding.pendingTools.size > 0) {",
               "\t\t\tconst ompPrefixMessages = context.messages.slice(0, binding.pendingContextCount);",
               "\t\t\tconst ompPrefixFingerprint = messagesFingerprint(ompPrefixMessages);",
@@ -549,7 +567,7 @@ const result = await build({
         // Continuity transactions are adapter-owned. Keep explicit pinned seams
         // so an upstream update cannot silently bypass the write-ahead marker.
         const continuityPatches = [
-          ['interface Binding {', 'interface Binding {\n ompFallbackContextTokens?: number; ompInFlight: boolean; ompInvalidated: boolean; ompCompactionInvalidated?: boolean; ompSeeding?: boolean; ompSeedText?: string; ompDropPromise?: Promise<void>; ompExpectedAssistantHasOutput: boolean; ompExpectedAssistantNormalized?: string; ompConversationFingerprint?: string; ompReleaseLease?: (wait?: boolean) => Promise<void>; pendingConversationFingerprint?: string; relay: ToolRelay; relayBridge?: PiMcpBridge; relayFingerprint: string;'],
+          ['interface Binding {', 'interface Binding {\n ompFallbackContextTokens?: number; ompInFlight: boolean; ompInvalidated: boolean; ompCompactionInvalidated?: boolean; ompSeeding?: boolean; ompSeedGuard?: HistorySeedGuard; ompImageCheckpoint?: ImageHistoryCheckpoint; ompDropPromise?: Promise<void>; ompExpectedAssistantHasOutput: boolean; ompExpectedAssistantNormalized?: string; ompConversationFingerprint?: string; ompReleaseLease?: (wait?: boolean) => Promise<void>; pendingConversationFingerprint?: string; relay: ToolRelay; relayBridge?: PiMcpBridge; relayFingerprint: string;'],
           ['let completeTurn: (() => void) | undefined;', 'let ompDispatched = false;\n\t\tlet completeTurn: (() => void) | undefined;'],
           ['if (existing) return existing;', `if (existing) {
             const value = await existing;
@@ -589,24 +607,34 @@ const result = await build({
               binding.ompSeeding = true;
               try {
                 for (const seedPrompt of parts.seedSteps) {
-                  binding.ompSeedText = '';
-                  if (options.signal?.aborted || binding.abortRequested) throw abortError();
-                  const seedResponse = await binding.connection.prompt({ sessionId: binding.session.sessionId, prompt: seedPrompt }, options.signal);
-                  if (binding.ompInvalidated) throw new AntigravityAcpError('protocol', 'ACP session ownership was lost');
-                  if (binding.abortRequested || seedResponse.stopReason === 'cancelled' || options.signal?.aborted) throw abortError();
-                  const seedQuota = quotaExhaustion(binding.ompSeedText ?? '');
-                  binding.ompSeedText = undefined;
-                  if (seedQuota) await this.ompThrowQuota(binding, seedQuota);
-                  if (seedResponse.stopReason !== 'end_turn') throw new AntigravityAcpError('protocol', \`ACP seed step stopped early with \${seedResponse.stopReason}\`);
-                  const seedUsage = usageFromPrompt(seedResponse);
-                  if (ompSeedUsage) {
-                    ompSeedUsage.input += seedUsage.input;
-                    ompSeedUsage.output += seedUsage.output;
-                    ompSeedUsage.cacheRead += seedUsage.cacheRead;
-                    ompSeedUsage.cacheWrite += seedUsage.cacheWrite;
-                    ompSeedUsage.totalTokens += seedUsage.totalTokens;
-                    ompSeedUsage.reasoning = (ompSeedUsage.reasoning ?? 0) + (seedUsage.reasoning ?? 0);
-                  } else ompSeedUsage = seedUsage;
+                  const guard = new HistorySeedGuard(options.signal);
+                  binding.ompSeedGuard = guard;
+                  try {
+                    if (options.signal?.aborted || binding.abortRequested) throw abortError();
+                    const seedResponse = await guard.run(signal => binding.connection.prompt({ sessionId: binding.session.sessionId, prompt: seedPrompt }, signal));
+                    if (binding.ompInvalidated) throw new AntigravityAcpError('protocol', 'ACP session ownership was lost');
+                    if (binding.abortRequested || seedResponse.stopReason === 'cancelled' || options.signal?.aborted) throw abortError();
+                    const seedQuota = quotaExhaustion(guard.text);
+                    if (seedQuota) await this.ompThrowQuota(binding, seedQuota);
+                    if (seedResponse.stopReason !== 'end_turn') throw new AntigravityAcpError('protocol', \`ACP seed step stopped early with \${seedResponse.stopReason}\`);
+                    guard.assertAcknowledged();
+                    const seedUsage = usageFromPrompt(seedResponse);
+                    if (ompSeedUsage) {
+                      ompSeedUsage.input += seedUsage.input;
+                      ompSeedUsage.output += seedUsage.output;
+                      ompSeedUsage.cacheRead += seedUsage.cacheRead;
+                      ompSeedUsage.cacheWrite += seedUsage.cacheWrite;
+                      ompSeedUsage.totalTokens += seedUsage.totalTokens;
+                      ompSeedUsage.reasoning = (ompSeedUsage.reasoning ?? 0) + (seedUsage.reasoning ?? 0);
+                    } else ompSeedUsage = seedUsage;
+                  } catch (error) {
+                    if (options.signal?.aborted || binding.abortRequested) throw abortError();
+                    if (error instanceof HistorySeedError) throw new AntigravityAcpError('protocol', error.message);
+                    throw error;
+                  } finally {
+                    guard.dispose();
+                    binding.ompSeedGuard = undefined;
+                  }
                 }
                 binding.ompSeeding = false;
               } finally {
@@ -640,7 +668,7 @@ const result = await build({
         const pendingFingerprintAnchor = "binding.pendingContextFingerprint = messagesFingerprint(context.messages);";
         if (contents.split(pendingFingerprintAnchor).length !== 4) throw new Error("Pinned pending context fingerprint seams changed");
         contents = contents.replaceAll(pendingFingerprintAnchor,
-          pendingFingerprintAnchor + "\n\t\t\tbinding.pendingConversationFingerprint = messagesFingerprint(context.messages.filter(message => message.role !== 'system'));");
+          pendingFingerprintAnchor + "\n\t\t\tbinding.pendingConversationFingerprint = messagesFingerprint(context.messages.filter(message => message.role !== 'system'));\n\t\t\tbinding.ompImageCheckpoint = captureImageHistoryCheckpoint(context.messages, this.ompImageMessageFingerprint);");
         const leasePatches = [
           ['const connection = this.createConnection({\n\t\t\tcwd,', 'let leaseLost = false;\n\t\tlet releaseLease: (() => Promise<void>) | undefined;\n\t\tconst connection = this.createConnection({\n\t\t\tcwd,'],
           ['onPermission: (request) => this.requestPermission(binding, request),\n\t\t\t},\n\t\t});\n\t\ttry {\n\t\t\tconst initialize = await connection.initialize();', `onPermission: (request) => this.requestPermission(binding, request),
@@ -762,6 +790,28 @@ const result = await build({
           private readonly ompToolsMemo = createStructuredFingerprintMemo();
           private ompMessagesFingerprint(messages: Context["messages"]): string { return messagesFingerprint(messages, this.ompSystemMemo); }
           private ompMessageFingerprint(message: Context["messages"][number]): string { return messageFingerprint(message, this.ompSystemMemo); }
+          private readonly ompImageMessageFingerprint = (message: Context["messages"][number]): string => this.ompMessageFingerprint(message);
+          private ompRebaseImageHistory(binding: Binding, context: Context): void {
+            if (!binding.ompImageCheckpoint || binding.needsReconstruction ||
+                binding.instructionsFingerprint !== instructionFingerprint(context)) return;
+            const active = Boolean(binding.turnCompletion) || Boolean(binding.permission) || binding.pendingTools.size > 0;
+            const count = active ? binding.pendingContextCount : binding.messageCount;
+            if (context.messages.length < count) return;
+            const prefix = context.messages.slice(0, count);
+            const current = this.ompMessagesFingerprint(prefix);
+            if (current === (active ? binding.pendingContextFingerprint : binding.historyFingerprint) ||
+                !matchesImageHistoryCheckpoint(binding.ompImageCheckpoint, prefix, this.ompImageMessageFingerprint)) return;
+            // Only proven image eviction is rebased. The actual provider payload is unchanged.
+            const conversation = this.ompMessagesFingerprint(prefix.filter(message => message.role !== 'system'));
+            if (active) {
+              binding.pendingContextFingerprint = current;
+              binding.pendingConversationFingerprint = conversation;
+            } else {
+              binding.historyFingerprint = current;
+              binding.ompConversationFingerprint = conversation;
+            }
+            binding.ompImageCheckpoint = captureImageHistoryCheckpoint(prefix, this.ompImageMessageFingerprint);
+          }
           private ompToolsFingerprint(tools: NonNullable<Context["tools"]>): string { return this.ompToolsMemo(tools, () => piToolFingerprint(tools)); }
           private ompRelayConfig() {
             const base = resolveRelayConfig();
@@ -848,6 +898,8 @@ const result = await build({
         contents = `import { drainCancelledTurn, isSteerAbort, steerMode } from ${JSON.stringify(path.join(root, "extension/turn-cancellation.ts"))};\n` + contents;
         contents = `import { claimContinuation } from ${JSON.stringify(path.join(root, "extension/continuation-claim.ts"))};\n` + contents;
         contents = `import { createHistoryFingerprintMemo } from ${JSON.stringify(path.join(root, "extension/history-fingerprint.ts"))};\nconst ompMessageFingerprintMemo = createHistoryFingerprintMemo();\n` + contents;
+        contents = `import { captureImageHistoryCheckpoint, matchesImageHistoryCheckpoint, type ImageHistoryCheckpoint } from ${JSON.stringify(path.join(root, "extension/image-history.ts"))};\n` + contents;
+        contents = `import { HistorySeedGuard, HistorySeedError } from ${JSON.stringify(path.join(root, "extension/history-seed.ts"))};\n` + contents;
         contents = `import { ToolRelay, resolveRelayConfig, relayControlTool, projectedMcpName, TOOL_RELAY_CONTROL_NAME } from ${JSON.stringify(path.join(root, "extension/tool-relay.ts"))};\n` + contents;
         contents = `import { AcpFailure } from ${JSON.stringify(path.join(root, "extension/acp-errors.ts"))};\n` + contents;
         return { contents, loader: "ts" };

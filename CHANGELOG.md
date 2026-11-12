@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — ldfhhc fork
+
+- Based on upstream 0.1.43. Preserve the local macOS CLI authentication lookup: check service `gemini`, account `antigravity`, without reading the password or requiring the ACP-only label. Logout behavior is unchanged.
+- Keep a warm ACP session when OMP replaces a previously accepted image with its exact provider-image-limit marker. Per-binding, in-memory checkpoints retain only positions and digests; text, image payload, tool identity/result and instruction edits still invalidate continuity. The sent context is not rewritten, and a restarted adapter does not inherit this image-eviction allowance.
+- Bound each hidden history/request seed step to 60 seconds regardless of progress. Require an exact trimmed `OK` acknowledgement; stop on the first observed tool/permission attempt or non-ACK response, retire the partial session and report an explicit protocol error with a compact-history hint. Quota notices keep their existing handling, and cancellation during a warm seed cannot preserve a partial checkpoint. The guard rejects bridged tools before dispatch but cannot undo an official runtime's native action already executed before its notification.
+- This is a source fork, not an npm or marketplace release. Build from this checkout to use these changes; the existing marketplace bootstrap still installs the upstream npm package. No official OMP/agy binaries or installed plugin configuration are changed by these source edits.
+
 ## 0.1.43 — 2026-11-11
 
 - Add `/antigravity-acp quota` live quota reporting through a separate short-lived ACP session. Concurrent reads share one request, snapshots are cached for 60 seconds, managed ACP is preferred when the CLI lacks `/usage`, and temporary-session usage is excluded from adapter accounting. Quota exhaustion is classified as non-retryable with an optional reset time.

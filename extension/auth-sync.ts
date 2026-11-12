@@ -47,7 +47,7 @@ export function createKeychain(run: (args: string[]) => Promise<void>, platform:
     // Check existence only: the item's ACL does not authorize the security
     // CLI, so a `find-generic-password -w` would pop the macOS keychain
     // password dialog. Attribute-only lookups stay prompt-free.
-    present: (): Promise<boolean | undefined> => check(["find-generic-password", "-s", "gemini", "-a", "antigravity-acp"], "Unable to inspect the Antigravity keychain entry"),
+    present: (): Promise<boolean | undefined> => check(["find-generic-password", "-s", "gemini", "-a", "antigravity"], "Unable to inspect the Antigravity keychain entry"),
     // Local logout for macOS keychain storage. The Antigravity server owns
     // this item; removing it is required for a complete logout when no token
     // file exists.
